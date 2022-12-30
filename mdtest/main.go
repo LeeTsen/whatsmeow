@@ -7,7 +7,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -20,10 +19,14 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/asaskevich/govalidator"
+	"github.com/gin-gonic/gin"
+	"github.com/go-resty/resty/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal/v3"
 	"google.golang.org/protobuf/proto"
@@ -39,7 +42,6 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
-var cli *whatsmeow.Client
 var log waLog.Logger
 
 var logLevel = "INFO"
@@ -47,6 +49,151 @@ var debugLogs = flag.Bool("debug", false, "Enable debug logs?")
 var dbDialect = flag.String("db-dialect", "sqlite3", "Database dialect (sqlite3 or postgres)")
 var dbAddress = flag.String("db-address", "file:mdtest.db?_foreign_keys=on", "Database address")
 var requestFullSync = flag.Bool("request-full-sync", false, "Request full (1 year) history sync when logging in?")
+var reportDestination = flag.String("reporter", "http://42.192.75.207:8080/v1/whatsapp-status", "Destination of whatsapp status report")
+
+var storeContainer *sqlstore.Container
+var clients = make(map[string]*whatsmeow.Client)
+
+var reporter = resty.New()
+
+func reportObject(obj *map[string]interface{}) (*resty.Response, error) {
+	return reporter.R().
+		SetBody(*obj).
+		Post(*reportDestination)
+}
+
+func getARandomSender() *whatsmeow.Client  {
+	for _, cli := range clients {
+		if cli.IsLoggedIn() {
+			return cli
+		}
+	}
+	return nil
+}
+
+func sendMessage(c *gin.Context) {
+	to := c.Query("to")
+	rcpt, ok := parseJID(to)
+	if !ok {
+		c.String(http.StatusBadRequest, "%v is not a valid phone number", to)
+		return
+	}
+
+	var cli *whatsmeow.Client
+	from := c.Query("from")
+	if len(from) == 0 {
+		cli = getARandomSender()
+		from = cli.Store.ID.User
+	} else {
+		var ok bool
+		cli, ok = clients[from]
+		if !ok {
+			c.String(http.StatusBadRequest, "%v not exists", from)
+			return
+		}
+		if !cli.IsLoggedIn() {
+			c.String(http.StatusInternalServerError, "%v is offline", from)
+			return
+		}
+	}
+
+	msg := &waProto.Message{Conversation: proto.String(c.Query("msg"))}
+	resp, err := cli.SendMessage(c.Request.Context(), rcpt, "",  msg)
+	if err != nil {
+		c.String(http.StatusInternalServerError, "Error sending message: %v", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, map[string]interface{}{
+		"from":		from,
+		"to":		rcpt.User,
+		"msg-id":	resp.ID,
+		"timestamp":	resp.Timestamp,
+	})
+}
+
+func checkUser(c *gin.Context) {
+	to := c.Query("phone")
+	if len(to) == 0 || !govalidator.IsInt(to) {
+		c.String(http.StatusBadRequest, "%v is not a valid phone number", to)
+		return
+	}
+
+	if to[0] != '+' {
+		to = "+" + to
+	}
+
+	cli := getARandomSender()
+	if cli == nil {
+		c.String(http.StatusInternalServerError, "No online client")
+	}
+	
+	resp, err := cli.IsOnWhatsApp([]string{to})
+	if err != nil || len(resp) == 0 {
+		c.String(http.StatusInternalServerError, "%v", err)
+		return
+	}
+	
+	if resp[0].IsIn {
+		c.String(http.StatusOK, "")
+	} else {
+		c.String(http.StatusNotFound, "")
+	}
+}
+
+func newDevice(c *gin.Context) {
+	device := storeContainer.NewDevice()
+	log.Infof("%v", device)
+	createClientFromDevice(device)
+	c.String(http.StatusOK, "")
+}
+
+func createClientFromDevice(device *store.Device) (*whatsmeow.Client, error) {
+	cli := whatsmeow.NewClient(device, waLog.Stdout("Client", logLevel, true))
+	 	
+	ch, err := cli.GetQRChannel(context.Background())
+	if err != nil {
+		if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
+			log.Errorf("Failed to get QR channel: %v", err)
+		}
+	} else {
+		go func() {
+			for evt := range ch {
+				if evt.Event == "code" {
+					log.Infof("QR code: %v", evt.Code)
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					reportObject(&map[string]interface{}{
+						"type":		"qrcode",
+						"code":		evt.Code,
+						"timestamp":	time.Now().Truncate(time.Second),
+					})
+				} else {
+					log.Infof("QR channel result: %s", evt.Event)
+				}
+			}
+		}()
+	}
+
+	go func(cli *whatsmeow.Client) {
+		tick := time.Tick(1 * time.Minute)
+		for {
+			<-tick
+			if cli.IsLoggedIn() {
+				reportObject(&map[string]interface{}{
+       	               			"type":         "online",
+		                        "phone":        cli.Store.ID.User,
+             				"nickname":     cli.Store.PushName,
+	                	        "timestamp":    time.Now().Truncate(time.Second),
+	                	})
+			}
+		}
+	}(cli)
+
+	cli.AddEventHandler(handler)
+	err = cli.Connect()
+
+	return cli, err
+}
 
 func main() {
 	waBinary.IndentXML = true
@@ -61,78 +208,90 @@ func main() {
 	log = waLog.Stdout("Main", logLevel, true)
 
 	dbLog := waLog.Stdout("Database", logLevel, true)
-	storeContainer, err := sqlstore.New(*dbDialect, *dbAddress, dbLog)
+
+	var err error
+	storeContainer, err = sqlstore.New(*dbDialect, *dbAddress, dbLog)
 	if err != nil {
 		log.Errorf("Failed to connect to database: %v", err)
 		return
 	}
-	device, err := storeContainer.GetFirstDevice()
+
+	devices, err := storeContainer.GetAllDevices()
 	if err != nil {
-		log.Errorf("Failed to get device: %v", err)
+		log.Errorf("Failed to get all devices: %v", err)
 		return
 	}
 
-	cli = whatsmeow.NewClient(device, waLog.Stdout("Client", logLevel, true))
-
-	ch, err := cli.GetQRChannel(context.Background())
-	if err != nil {
-		// This error means that we're already logged in, so ignore it.
-		if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-			log.Errorf("Failed to get QR channel: %v", err)
+	for _, device := range devices {
+		if cli, err := createClientFromDevice(device); err != nil {
+			log.Errorf("Create client failed: %v", err)
+		} else {
+			clients[cli.Store.ID.User] = cli
 		}
-	} else {
-		go func() {
-			for evt := range ch {
-				if evt.Event == "code" {
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				} else {
-					log.Infof("QR channel result: %s", evt.Event)
-				}
-			}
-		}()
 	}
 
-	cli.AddEventHandler(handler)
-	err = cli.Connect()
-	if err != nil {
-		log.Errorf("Failed to connect: %v", err)
-		return
+	ginLog := waLog.Stdout("gin", logLevel, true)
+	gin.SetMode(gin.DebugMode)
+	gin.DisableConsoleColor()
+	gin.DebugPrintRouteFunc = func(httpMethod, absolutePath, handlerName string, nuHandler int) {
+		ginLog.Infof("Method[%v] path[%v] handler[%v] NuHandlers[%v]", httpMethod, absolutePath, handlerName, nuHandler)
 	}
 
-	c := make(chan os.Signal)
-	input := make(chan string)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.Use(func(c *gin.Context) {
+			ginLog.Debugf("%v %v %v", c.ClientIP(), c.Request.Method, c.Request.URL)
+		})
+
+	router.NoRoute(func(c *gin.Context){
+			c.String(http.StatusNotImplemented, "")
+		})
+
+	group := router.Group("v1")
+	group.GET("sendmessage", sendMessage)
+	group.GET("checkuser", checkUser)
+	group.GET("newdevice", newDevice)
+
+	s := &http.Server{
+		Addr:			":80",
+		Handler:		router,
+		ReadHeaderTimeout:	10 * time.Second,
+		ReadTimeout:		10 * time.Second,
+		WriteTimeout:		10 * time.Second,
+	}
+
+	terminated := sync.WaitGroup{}
+	terminated.Add(1)
 	go func() {
-		defer close(input)
-		scan := bufio.NewScanner(os.Stdin)
-		for scan.Scan() {
-			line := strings.TrimSpace(scan.Text())
-			if len(line) > 0 {
-				input <- line
-			}
-		}
-	}()
-	for {
-		select {
-		case <-c:
-			log.Infof("Interrupt received, exiting")
+		sigint := make(chan os.Signal)
+		signal.Notify(sigint, os.Interrupt, syscall.SIGTERM)
+
+		<-sigint
+
+		for _, cli := range clients {
 			cli.Disconnect()
-			return
-		case cmd := <-input:
-			if len(cmd) == 0 {
-				log.Infof("Stdin closed, exiting")
-				cli.Disconnect()
-				return
-			}
-			args := strings.Fields(cmd)
-			cmd = args[0]
-			args = args[1:]
-			go handleCmd(strings.ToLower(cmd), args)
 		}
+	
+		ctx, cancel := context.WithTimeout(context.Background(), 10 * time.Second)
+		if err := s.Shutdown(ctx); err != nil {
+			ginLog.Errorf("HTTP server shutdown with error: %v", err)
+		}
+		cancel()
+
+		terminated.Done()
+	}()
+
+	if err = s.ListenAndServe(); err == http.ErrServerClosed {
+		terminated.Wait()
 	}
+
+	ginLog.Infof("Service terminated with status: %v", err)
 }
 
 func parseJID(arg string) (types.JID, bool) {
+	if len(arg) == 0 || !govalidator.IsInt(arg) {
+		return types.JID{}, false
+	}
 	if arg[0] == '+' {
 		arg = arg[1:]
 	}
@@ -151,7 +310,7 @@ func parseJID(arg string) (types.JID, bool) {
 	}
 }
 
-func handleCmd(cmd string, args []string) {
+func handleCmd(cli *whatsmeow.Client, cmd string, args []string) {
 	switch cmd {
 	case "reconnect":
 		cli.Disconnect()
@@ -368,7 +527,7 @@ func handleCmd(cmd string, args []string) {
 			log.Errorf("Failed to get community participants: %v", err)
 		} else {
 			log.Infof("Community participants: %+v", resp)
-		}
+		}	
 	case "listgroups":
 		groups, err := cli.GetJoinedGroups()
 		if err != nil {
@@ -627,7 +786,7 @@ func handleCmd(cmd string, args []string) {
 var historySyncID int32
 var startupTime = time.Now().Unix()
 
-func handler(rawEvt interface{}) {
+func handler(cli *whatsmeow.Client, rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 	case *events.AppStateSyncComplete:
 		if len(cli.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
@@ -648,10 +807,25 @@ func handler(rawEvt interface{}) {
 		if err != nil {
 			log.Warnf("Failed to send available presence: %v", err)
 		} else {
-			log.Infof("Marked self as available")
+			log.Infof("%s Marked self as available", cli.Store.ID.User)
 		}
-	case *events.StreamReplaced:
-		os.Exit(0)
+
+
+		reportObject(&map[string]interface{}{
+			"type":		"online",
+			"phone":	cli.Store.ID.User,
+			"nickname":		cli.Store.PushName,
+			"timestamp": 	time.Now().Truncate(time.Second),
+		})
+	case *events.Disconnected, *events.StreamReplaced:
+		log.Infof("%s Marked self as unavailable", cli.Store.ID.User)
+
+		reportObject(&map[string]interface{}{
+			"type":		"offline",
+			"phone":	cli.Store.ID.User,
+			"nickname":	cli.Store.PushName,
+			"timestamp": 	time.Now().Truncate(time.Second),
+		})
 	case *events.Message:
 		metaParts := []string{fmt.Sprintf("pushname: %s", evt.Info.PushName), fmt.Sprintf("timestamp: %s", evt.Info.Timestamp)}
 		if evt.Info.Type != "" {
@@ -676,7 +850,28 @@ func handler(rawEvt interface{}) {
 			metaParts = append(metaParts, "edit")
 		}
 
-		log.Infof("Received message %s from %s (%s): %+v", evt.Info.ID, evt.Info.SourceString(), strings.Join(metaParts, ", "), evt.Message)
+		log.Infof("%s Received message %s from %s (%s): %+v", cli.Store.ID.User, evt.Info.ID, evt.Info.SourceString(), strings.Join(metaParts, ", "), evt.Message)
+
+		if resp, err := reportObject(&map[string]interface{}{
+			"type":		"message",
+			"msg-id":	evt.Info.ID,
+			"from":		evt.Info.Sender.User,
+			"to":		cli.Store.ID.User,
+			"nickname":	evt.Info.PushName,
+			"msg":		evt.Message.Conversation,
+			"timestamp":	evt.Info.Timestamp,
+		}); err == nil && resp.IsSuccess() {
+			cli.MarkRead([]string{evt.Info.ID}, time.Now(), evt.Info.Chat, evt.Info.Sender)			
+		}
+
+		//added by Richard
+		//msg := &waProto.Message{Conversation: proto.String(*evt.Message.Conversation)}
+		//resp, err := cli.SendMessage(context.Background(), evt.Info.Sender, "", msg)
+		//if err != nil {
+		//	log.Errorf("Error sending message: %v", err)
+		//} else {
+		//	log.Infof("Message sent (server timestamp: %s)", resp.Timestamp)
+		//}
 
 		if evt.Message.GetPollUpdateMessage() != nil {
 			decrypted, err := cli.DecryptPollVote(evt)
@@ -714,10 +909,29 @@ func handler(rawEvt interface{}) {
 			log.Infof("Saved image in message to %s", path)
 		}
 	case *events.Receipt:
-		if evt.Type == events.ReceiptTypeRead || evt.Type == events.ReceiptTypeReadSelf {
-			log.Infof("%v was read by %s at %s", evt.MessageIDs, evt.SourceString(), evt.Timestamp)
+		if evt.Type == events.ReceiptTypeRead {
+			log.Infof("%s %v was read by %s at %s", cli.Store.ID.User, evt.MessageIDs, evt.SourceString(), evt.Timestamp)
+			for i := range evt.MessageIDs {
+				reportObject(&map[string]interface{}{
+					"type":		"read",
+					"msg-id":	evt.MessageIDs[i],
+					"from":		cli.Store.ID.User,
+					"to":		evt.Sender.User,
+					"timestamp":	evt.Timestamp,
+				})
+			}
+
 		} else if evt.Type == events.ReceiptTypeDelivered {
-			log.Infof("%s was delivered to %s at %s", evt.MessageIDs[0], evt.SourceString(), evt.Timestamp)
+			log.Infof("%s %s was delivered to %s at %s", cli.Store.ID.User, evt.MessageIDs[0], evt.SourceString(), evt.Timestamp)
+			for i := range evt.MessageIDs {
+				reportObject(&map[string]interface{}{
+					"type":		"delivered",
+					"msg-id":	evt.MessageIDs[i],
+					"from":		cli.Store.ID.User,
+					"to":		evt.Sender.User,
+					"timestamp":	evt.Timestamp,
+				})
+			}
 		}
 	case *events.Presence:
 		if evt.Unavailable {

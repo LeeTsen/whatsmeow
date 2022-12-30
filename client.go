@@ -32,7 +32,7 @@ import (
 )
 
 // EventHandler is a function that can handle events from WhatsApp.
-type EventHandler func(evt interface{})
+type EventHandler func(cli *Client, evt interface{})
 type nodeHandler func(node *waBinary.Node)
 
 var nextHandlerID uint32
@@ -164,6 +164,9 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		Log:             log,
 		recvLog:         log.Sub("Recv"),
 		sendLog:         log.Sub("Send"),
+		//Log:             log.Sub(deviceStore.ID.User),
+                //recvLog:         log.Sub("Recv/" + deviceStore.ID.User),
+                //sendLog:         log.Sub("Send/" + deviceStore.ID.User),
 		uniqueID:        fmt.Sprintf("%d.%d-", randomBytes[0], randomBytes[1]),
 		responseWaiters: make(map[string]chan<- *waBinary.Node),
 		eventHandlers:   make([]wrappedEventHandler, 0, 1),
@@ -381,6 +384,7 @@ func (cli *Client) Disconnect() {
 // Disconnect closes the websocket connection.
 func (cli *Client) unlockedDisconnect() {
 	if cli.socket != nil {
+		go cli.dispatchEvent(&events.Disconnected{})
 		cli.socket.Stop(true)
 		cli.socket = nil
 		cli.clearResponseWaiters(xmlStreamEndNode)
@@ -577,7 +581,7 @@ func (cli *Client) dispatchEvent(evt interface{}) {
 		}
 	}()
 	for _, handler := range cli.eventHandlers {
-		handler.fn(evt)
+		handler.fn(cli, evt)
 	}
 }
 
